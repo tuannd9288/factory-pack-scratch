@@ -1,0 +1,141 @@
+# The jobs that read the pull request as data. On pull_request_target GitHub runs main's copy of this file, and every
+# job runs main's scripts from ./trusted, whatever the pull request changes. None runs the candidate's code, which
+# runs only in gate.yml on pull_request, and none restores an Actions cache, which this event shares with main.
+#   review, verdict
+#            read the candidate as data: its commits are fetched into main's checkout with no work tree. They wait
+#            for gate.yml's verify on the head and run the reviewer only once it passed. The reviewer's credentials
+#            come from the environment "reviewer", whose branch policy admits main alone.
+#   tier     the tier, and on tier 3 the Human's approval of the head, or of a commit whose patch the head carries
+#            unchanged; it waits on nothing, so after his approval the queue re-runs it alone.
+# The required checks are verify (gate.yml), review, verdict and tier (.gate/ruleset.json). No required job here has
+# `needs`: a job skipped because a job it needs failed counts as passing. rounds, not required, runs after a red
+# review or verdict (both fail while verify is red) and labels needs-human at the third head commit judged red.
+name: gate-trusted
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-trusted-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BASE: ${{ github.event.pull_request.base.sha }}
+  HEAD: ${{ github.event.pull_request.head.sha }}
+  GATE_HEAD: ${{ github.event.pull_request.head.sha }}
+  GATE_PR: ${{ github.event.pull_request.number }}
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    environment: reviewer
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Fetch the candidate's commits, with no work tree
+        run: git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags --quiet origin "$HEAD"
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: |
+          printf '%s\n' "$BODY" >"$RUNNER_TEMP/pr-body.txt"
+          GATE_BODY_FILE="$RUNNER_TEMP/pr-body.txt" scripts/review review --base "$BASE" --head "$HEAD"
+        working-directory: trusted
+        env:
+          GATE_REVIEWER: ${{ vars.GATE_REVIEWER }}
+          BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+
+  verdict:
+    name: verdict
+    runs-on: ubuntu-latest
+    environment: reviewer
+    timeout-minutes: 70
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Fetch the candidate's commits, with no work tree
+        run: git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags --quiet origin "$HEAD"
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: scripts/review verdict --base "$BASE" --head "$HEAD"
+        working-directory: trusted
+        env:
+          GATE_REVIEWER: ${{ vars.GATE_REVIEWER }}
+          GH_TOKEN: ${{ github.token }}
+
+  tier:
+    name: tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Fetch the candidate's commits, with no work tree
+        run: git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags --quiet origin "$HEAD"
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: scripts/review tier --base "$BASE" --head "$HEAD" | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        working-directory: trusted
+        env:
+          GATE_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_TOKEN: ${{ github.token }}
+
+  rounds:
+    name: rounds
+    needs: [review, verdict]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: scripts/review rounds
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
