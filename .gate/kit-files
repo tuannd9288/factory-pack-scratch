@@ -37,6 +37,7 @@ scripts/lib/result.mjs
 scripts/lib/reviewer-prompt.md
 scripts/lib/reviewer.json
 scripts/lib/rules.mjs
+scripts/lib/ship.mjs
 scripts/lib/stub-reviewer.mjs
 scripts/lib/subject.mjs
 scripts/lib/tier.mjs
@@ -49,6 +50,7 @@ scripts/reviewer/package-lock.json
 scripts/reviewer/package.json
 scripts/rules
 scripts/setup
+scripts/ship
 scripts/tier
 scripts/verify
 scripts/verify-trusted
