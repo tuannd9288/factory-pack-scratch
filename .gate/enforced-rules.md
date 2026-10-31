@@ -29,6 +29,8 @@ as `prose` and gets one, or is deleted, within 30 days.
 | A pull request names its team in a `Team:` line | `verify-trusted` (`.gate/bin/lib/prbody.mjs`), from the body GitHub gives `gate.yml`; `Session:` and `Cost:` inform and gate nothing |
 | A pull request's `Claim:` is the tip of `claim/<n>` for the issue named in `Issue:`, that issue is open, and it closes no other issue | `tier`, which reads the ref when it ends; `.gate/bin/claim` re-runs `tier` of the open pull requests of an issue it releases or hands off, and a claim moved by a raw `git push` is not re-checked until a run |
 | A pull request whose head is in another repository gets a red `review` before any step that holds the credential | `gate-trusted.yml`'s first `review` step, red and never skipped, since a skipped required job passes |
+| Auto-merge only on a base of `main`; a pull request opens only after a local pass; a tier 3 is armed, then stops until the Human approves; `needs-human` stops before arming | `scripts/ship`, on the stamps a full `verify` and `red-check` leave; a push is never refused |
+| Auto-merge armed only while a live PASS or PASS+NOTES covers the head or its patch (with no driver on `main`, the pull request author's unedited `not run as a user: no driver` note for the head covers it in place of a verdict); disarmed on the next `ship` once a patch moved past its verdict | `scripts/ship`, on `scripts/live-verify --covered`; the ledger lists each merged pull request no verdict covered |
 
 ## Commands
 
