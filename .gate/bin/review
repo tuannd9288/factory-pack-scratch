@@ -11,18 +11,34 @@
 # The reviewer runs only once `verify` (gate.yml, on pull_request) passed on the head: the cheaper judge first, and a
 # red head needs a new commit anyway. The job waits for it up to GATE_WAIT seconds (default: the minutes
 # GATE_VERIFY_TIMEOUT of .gate/config.sh gives verify, which .gate/bin/verify-timeout reads), then fails closed.
-#   tier     labels the tier; below tier 3 by paths and labels it waits for `review` of its own workflow run (GITHUB_RUN_ID,
-#            up to GATE_REVIEW_WAIT, default 6000 s), so it is never green before the reviewer ended, and follows it: a
-#            red or cancelled `review` fails it. It reads the review's result annotation whatever the conclusion; a raise
-#            there (or in any review on this head) labels the pull request raised and tier-3, and a result left absent
-#            fails it. A raise needs an approval given after it. On tier 3 it requires a code owner who is not the
-#            author to have approved the head commit, or a commit whose own patch the head carries unchanged
+#   tier     labels the tier; it waits for `review` of its own workflow run (GITHUB_RUN_ID, up to GATE_REVIEW_WAIT, default
+#            6000 s), tier 3 included (#333: so the merge switch is read when the gate's run is nearly over), so it is never
+#            green before the reviewer ended, and follows it: a red or cancelled `review` fails it. It reads the review's
+#            result annotation whatever the conclusion; below tier 3 a raise there (or in any review on this head) labels
+#            the pull request raised and tier-3, and a result left absent fails it. A raise needs an approval given after
+#            it. Text drawn from the pull request is printed between ::stop-commands:: markers with a random token. On tier 3
+#            it requires a code owner who is not the author to have approved the head commit, or a commit whose own patch the head carries unchanged
 #            (.gate/bin/lib/approval.mjs); the queue re-runs it after that approval, so the reviewer never runs again for a
-#            click
-#   rounds   counts the head commits the gate judged red; at three it labels the pull request needs-human (tier 3)
+#            click. Before that it reads the repository's merge switch (#333, .gate/bin/lib/switch.mjs) from the rules in
+#            force on the base branch and records the position on its own check run (the annotation "merge switch"): on
+#            tier 3, at `all` the approval is not asked, at `1-2` and `none` it is, and rules it cannot read as a position
+#            fail it; below tier 3 nothing is read. The claim, the labels and the other checks are asked at every position;
+#            the queue re-runs a tier 3 check whose recorded position and the one in force differ in a way that changes
+#            its verdict
+#            While it waits for the approval (approval.mjs exits 1) it requests the review of the code owners of
+#            .github/CODEOWNERS other than the author, users only, with one POST to the pull request's requested_reviewers
+#            for each owner (#374): the pull request is in their review queue. It requests nothing below tier 3, at the
+#            switch's `all` or once approved, and a failed request prints one line and leaves the result as it was
+#            Once the tier is final it also writes it for Linear's Reviews (#379): post_risk below, one comment of the pull
+#            request that holds a `linear:extension` riskScore block for the head, at every tier and every switch position;
+#            a failed write prints one line and leaves the result as it was
+#   rounds   counts the head commits the gate judged red; at three it labels the pull request needs-human (tier 3) and,
+#            unless the merge switch is at `all` or cannot be read, requests the same owners' review (#374), since tier
+#            does not see the label until the next event
 # The tier is main's policy on the diff from the merge-base, raised by every label the pull request ever had (GATE_PR
 # and GITHUB_REPOSITORY, read with gh). GATE_HEAD, the pull request's head, must be the head judged.
-# GATE_REVIEWER picks the reviewer; it is a repository variable, which only an admin sets:
+# GATE_REVIEWER picks the reviewer; gate-trusted.yml on main holds it, filled in by bin/onboard, so only a pull request the
+# Human approves changes it (#335):
 #   stub    scratch repositories only: .gate/bin/lib/stub-reviewer.mjs, no model
 #   claude  .gate/bin/lib/claude-reviewer.mjs: Claude Code, Opus at max effort, read-only tools, in `review` only, once per head:
 #           an earlier review of this head, base, No-red line and closing issues (any run of this workflow) is reused, not asked
@@ -57,6 +73,62 @@ while [ "$#" -gt 0 ]; do
   shift 2
 done
 case "$job" in review | verdict | tier | rounds) ;; *) echo "usage: .gate/bin/review review|verdict|tier --base <sha> --head <sha>, or .gate/bin/review rounds"; exit 2 ;; esac
+# Requests the review of the code owners of .github/CODEOWNERS (main's) other than the author, so the pull request is in their
+# review queue while it waits for their approval (#374). Users only: a team owner is named, not requested. One POST for each
+# owner, since GitHub refuses a whole request (422) when one of its users is not a collaborator. A failed request prints one
+# line and changes nothing: the caller's result stands.
+request_owners() {
+  local list kind who draft done_=() failed=()
+  draft=$(gh pr view "${GATE_PR:-}" --repo "${GITHUB_REPOSITORY:-}" --json isDraft --jq .isDraft) ||
+    { echo "$job: could not read draft status; no code-owner review requested"; return 0; }
+  [ "$draft" = false ] || return 0
+  list=$(node .gate/bin/lib/approval.mjs --owners .github/CODEOWNERS --author "${GATE_PR_AUTHOR:-}" --list) ||
+    { echo "$job: could not request the review of the code owners: .github/CODEOWNERS could not be read"; return 0; }
+  while read -r kind who; do
+    case "$kind" in
+      user)
+        if gh api -X POST "repos/${GITHUB_REPOSITORY:-}/pulls/${GATE_PR:-}/requested_reviewers" -f "reviewers[]=$who" >/dev/null 2>&1; then
+          done_+=("$who")
+        else
+          failed+=("$who")
+        fi
+        ;;
+      team) echo "$job: the code owner $who is a team, which is not requested" ;;
+    esac
+  done <<<"$list"
+  [ "${#done_[@]}" -eq 0 ] || echo "$job: requested the review of ${done_[*]}"
+  [ "${#failed[@]}" -eq 0 ] || echo "$job: could not request the review of ${failed[*]}"
+  return 0
+}
+# Writes the tier as the gate judged it into Linear's Reviews (#379): one comment of the pull request, found by its marker among
+# the comments the job's own login wrote (github-actions[bot], the login of the job's token; GATE_BOT_LOGIN overrides) and edited,
+# or created when there is none, and left alone when it already holds the body the run would write. The comment holds a `linear:extension` block with the riskScore plugin for $head: level 1, 2 or 3
+# for tier 1, 2 or 3 (Linear's level 4 is not used, the gate has no fourth tier), and the reasons tier printed, cut to Linear's
+# limits (.gate/bin/lib/risk-score.mjs). It records the tier, for every tier and at every position of the merge switch, and asks
+# nothing of anyone. No Linear key and no Linear call. A failed read or write prints one line and changes nothing: the caller's
+# result stands. Takes the tier command's output and the tier number.
+post_risk() {
+  local text="$1" level="$2" comment list found id same
+  comment=$(printf '%s\n' "$text" | node .gate/bin/lib/risk-score.mjs body --sha "$head" --tier "$level") ||
+    { echo "$job: could not write the risk score for Linear's Reviews: the comment could not be built${comment:+ ($comment)}"; return 0; }
+  list=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY:-}/issues/${GATE_PR:-}/comments?per_page=100") ||
+    { echo "$job: could not write the risk score for Linear's Reviews: the comments could not be read"; return 0; }
+  found=$(printf '%s' "$list" | node .gate/bin/lib/risk-score.mjs find --login "${GATE_BOT_LOGIN:-github-actions[bot]}" --body "$comment") ||
+    { echo "$job: could not write the risk score for Linear's Reviews: the comments could not be read as comments"; return 0; }
+  read -r id same <<<"$found"
+  if [ "$same" = same ]; then
+    echo "$job: the risk score comment for Linear's Reviews already holds tier $level at ${head:0:8}; nothing written"
+    return 0
+  elif [ -n "$id" ]; then
+    gh api -X PATCH "repos/${GITHUB_REPOSITORY:-}/issues/comments/$id" -f "body=$comment" >/dev/null 2>&1 ||
+      { echo "$job: could not edit the risk score comment for Linear's Reviews"; return 0; }
+  else
+    gh api -X POST "repos/${GITHUB_REPOSITORY:-}/issues/${GATE_PR:-}/comments" -f "body=$comment" >/dev/null 2>&1 ||
+      { echo "$job: could not write the risk score comment for Linear's Reviews"; return 0; }
+  fi
+  echo "$job: wrote the risk score for Linear's Reviews (tier $level at ${head:0:8})"
+  return 0
+}
 # A red round is a head commit on which a required check other than tier failed; tier waits on the Human, not the writer.
 if [ "$job" = rounds ]; then
   checks=$(node .gate/bin/lib/policy.mjs checks | grep -vx tier | paste -sd, -) &&
@@ -65,7 +137,10 @@ if [ "$job" = rounds ]; then
   echo "rounds: $n head commits judged red"
   [ "$n" -ge 3 ] || exit 0
   gh pr edit "$GATE_PR" --repo "$GITHUB_REPOSITORY" --add-label needs-human >/dev/null || { echo "rounds: could not add the label needs-human"; exit 1; }
-  echo "rounds: labelled needs-human after three red rounds; the tier check now waits for the Human's approval"
+  echo "rounds: labelled needs-human after three red rounds; the tier check now waits for the Human's approval; at the merge switch's position all it does not wait for one"
+  # Where his approval is asked, he is requested too, so the pull request is in his queue; a position that cannot be read asks nothing.
+  position=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY:-}/rules/branches/${GATE_BASE_REF:-main}" 2>&1 | node .gate/bin/lib/switch.mjs) &&
+    [ "$position" != all ] && request_owners
   exit 0
 fi
 head=$(git rev-parse --verify --quiet "${head:-none}^{commit}") && fork=$(git merge-base "${base:-none}" "$head" 2>/dev/null) ||
@@ -80,8 +155,20 @@ tier_of() {
   local out code
   out=$(.gate/bin/tier --base "$fork" --head "$head" --rules "$trusted" ${GATE_PR:+--pr "$GATE_PR"})
   code=$?
-  echo "$out"
+  # The reasons hold changed paths, which a pull request names: none may read as a workflow command in the log, even after
+  # white space (the runner trims it), as a legacy `##[` command or as an escaped line break at the start of a line.
+  echo "$out" | sed -e 's/^\([[:space:]]*\)::/\1: :/' -e 's/^\([[:space:]]*\)%0[aA]/\1% 0A/' -e 's/##\[/## [/g'
   [ "$code" -eq 0 ] || { echo "$job: the tier could not be computed, so this check fails closed"; return 1; }
+}
+
+# Prints text drawn from the pull request (changed paths, the claim's team) between ::stop-commands::<token> and ::<token>::,
+# the token fresh random text made here, so no line of it is read as a workflow command whatever characters precede it, and
+# tier's own notice, printed after the closing line, is never swallowed. Fails closed when no token can be made.
+guarded() {
+  local token
+  token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#token}" -ge 16 ] || { echo "$job: no random token could be made to hold the pull request's text, so this check fails closed"; exit 1; }
+  printf '::stop-commands::%s\n%s\n::%s::\n' "$token" "$1" "$token"
 }
 
 # The pull request's Issue: and Claim: lines against the tip of claim/<n> on origin, read now (claim.mjs check). Red prints
@@ -92,7 +179,7 @@ claim_check() {
   [ -n "${GATE_PR:-}" ] || return 0
   msg=$(node .gate/bin/lib/claim.mjs check --repo "${GITHUB_REPOSITORY:-}" --pr "$GATE_PR")
   code=$?
-  [ "$code" -eq 0 ] || { echo "$msg"; echo "tier: the claim check is red, so this check fails"; return 1; }
+  [ "$code" -eq 0 ] || { guarded "$msg"; echo "tier: the claim check is red, so this check fails"; return 1; }
   claim_msg=$msg
 }
 
@@ -139,7 +226,7 @@ entire_check() {
     { echo "tier: Entire's check on ${head:0:8} could not be read ($state), so this check fails closed"; return 1; }
   case "$state" in
     success) echo "tier: Entire Gates passed ${head:0:8}" ;;
-    unpinned) echo "tier: the rules in force on $GATE_BASE_REF do not require Entire Gates from one App, so its check cannot be told from a copy, and this check fails closed; the owner runs bin/onboard-owner --apply with GATE_REVIEWER=entire"; return 1 ;;
+    unpinned) echo "tier: the rules in force on $GATE_BASE_REF do not require Entire Gates from one App, so its check cannot be told from a copy, and this check fails closed; the owner runs bin/onboard-owner --apply once main's gate-trusted.yml holds GATE_REVIEWER: 'entire'"; return 1 ;;
     pending) echo "tier: Entire Gates has not concluded on ${head:0:8}; the queue re-runs this check when it does"; return 1 ;;
     *) echo "tier: Entire Gates is $state on ${head:0:8}; only success passes (Entire is neutral while a gate blocks), so this check fails"; return 1 ;;
   esac
@@ -180,7 +267,7 @@ wait_verdict() {
 
 case "$job" in
   tier)
-    out=$(tier_of) || { echo "$out"; exit 1; }
+    out=$(tier_of) || { guarded "$out"; exit 1; }
     n=$(echo "$out" | sed -n '1s/^tier \([123]\)$/\1/p')
     # A moved claim fails at once, and again after the wait, which can last an hour: the claim is read when tier ends.
     claim_check || exit 1
@@ -191,16 +278,21 @@ case "$job" in
   a No-red line, which no reviewer judges under Entire: the Human does"
       n=3
     fi
-    # Paths and labels already giving tier 3, a raise adds nothing: the wait is for the other tiers only. Every line that
-    # prints the reviewer's reason starts with a fixed prefix and holds it on one line with `##[` broken. Entire's
-    # review is read below, not waited for.
-    if [ "$n" != 3 ] && [ -n "${GATE_PR:-}" ] && [ -z "$entire" ]; then
+    # Every tier waits for the review of its own run, tier 3 too (#333): the switch is read, and recorded, only once the review
+    # is in, so the position tier records is the one in force when the gate's run is nearly over, not at its first seconds.
+    # Paths and labels already giving tier 3, a raise adds nothing. Every line that prints the reviewer's reason starts with a
+    # fixed prefix and holds it on one line with `##[` broken. Entire's review is read below, not waited for.
+    was=$n
+    if [ -n "${GATE_PR:-}" ] && [ -z "$entire" ]; then
       wait_review || exit 1
       if [ -n "$unavailable" ]; then
-        echo "$out"
+        guarded "$out"
         echo "tier: reviewer unavailable ($unavailable); this is not a finding on the change, so this check fails closed. Re-run the failed jobs when the reviewer is back"
         exit 1
       fi
+      # At tier 3 a raise adds nothing: it labels nothing, prints nothing, and must not set the time an approval has to follow
+      # (the approval check below reads $did_raise), so an approval given before this run still counts.
+      [ "$was" != 3 ] || did_raise=""
       if [ -n "$did_raise" ]; then
         # Adding a label a pull request already has makes no event, and the approval must follow this one's: remove first.
         if ! gh pr edit "$GATE_PR" --repo "$GITHUB_REPOSITORY" --remove-label raised >/dev/null 2>&1; then
@@ -213,24 +305,27 @@ case "$job" in
         gh pr edit "$GATE_PR" --repo "$GITHUB_REPOSITORY" --add-label raised --add-label tier-3 >/dev/null ||
           { echo "tier: the reviewer raised this change, and the labels raised and tier-3 could not be added; if raised does not exist, create it: gh label create raised --repo ${GITHUB_REPOSITORY:-}"; exit 1; }
       fi
-      # The labels are read again: a label added during the wait counts.
-      out=$(tier_of) || { echo "$out"; exit 1; }
-      n=$(echo "$out" | sed -n '1s/^tier \([123]\)$/\1/p')
+      # The labels are read again: a label added during the wait counts. A tier never drops, so a tier 3 needs no second read.
+      if [ "$was" != 3 ]; then
+        out=$(tier_of) || { guarded "$out"; exit 1; }
+        n=$(echo "$out" | sed -n '1s/^tier \([123]\)$/\1/p')
+      fi
       if [ -n "$did_raise" ]; then
         out="tier 3
   raised by the reviewer: $raised"
         n=3
       fi
       if [ -n "$review_red" ]; then
-        echo "$out"
+        guarded "$out"
         echo "tier: review is red; tier follows it, so this check fails"
         exit 1
       fi
     fi
     claim_check || exit 1
-    echo "$out"
-    [ -z "$claim_msg" ] || echo "$claim_msg"
+    guarded "$out"
+    [ -z "$claim_msg" ] || guarded "$claim_msg"
     if [ -n "${GATE_PR:-}" ]; then
+      post_risk "$out" "$n"
       gh pr edit "$GATE_PR" --repo "$GITHUB_REPOSITORY" --add-label "tier-$n" >/dev/null || echo "tier: could not add the label tier-$n, which only shows the tier"
       for k in 1 2 3; do
         [ "$k" -lt "$n" ] && gh pr edit "$GATE_PR" --repo "$GITHUB_REPOSITORY" --remove-label "tier-$k" >/dev/null 2>&1
@@ -238,6 +333,18 @@ case "$job" in
     fi
     [ -z "$entire" ] || entire_check || exit 1
     [ "$n" = 3 ] || exit 0
+    # The merge switch (#333), read from the rules in force on the base branch (GATE_BASE_REF): at all, the Human's approval of
+    # tier 3 is not asked; at 1-2 and none it is, as before. Rules that cannot be read as a position fail closed. The position
+    # read is recorded on this job's own check run, as the annotation "merge switch", which only this job can write: the queue
+    # compares it with the position in force and re-runs a tier 3 check that ran at another. No record is written when the
+    # rules cannot be read.
+    position=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY:-}/rules/branches/${GATE_BASE_REF:-main}" 2>&1 | node .gate/bin/lib/switch.mjs) ||
+      { echo "tier: the merge switch could not be read ($position), so this check fails closed"; exit 1; }
+    echo "::notice title=merge switch::$position"
+    if [ "$position" = all ]; then
+      echo "tier: the merge switch of this repository is at all, so the Human's approval of tier 3 is not asked"
+      exit 0
+    fi
     reviews=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY:-}/pulls/${GATE_PR:-}/reviews") || { echo "tier: tier 3 needs the Human's approval, and the reviews could not be read"; exit 1; }
     # A raised pull request needs an approval given after the raise: the Human reads the reason, not an earlier head.
     after=""
@@ -245,18 +352,28 @@ case "$job" in
       after=$(node .gate/bin/lib/history.mjs raised-at --repo "${GITHUB_REPOSITORY:-}" --pr "$GATE_PR") || { echo "tier: when the pull request was raised could not be read ($after), so this check fails closed"; exit 1; }
       [ -n "$after" ] || [ -z "${did_raise:-}" ] || after=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     fi
-    printf '%s' "$reviews" | node .gate/bin/lib/approval.mjs --owners .github/CODEOWNERS --author "${GATE_PR_AUTHOR:-}" --head "$head" --base "$base" ${after:+--after "$after"} || exit 1
-    exit 0
+    # An approval given before the base last changed showed the diff from the old base: it counts only through the old base's merged
+    # pull request (FAC-41: a stack's child moved onto main before its parent landed carries the parent's change).
+    moved=""
+    if [ -n "${GATE_PR:-}" ]; then
+      moved=$(node .gate/bin/lib/history.mjs moved --repo "${GITHUB_REPOSITORY:-}" --pr "$GATE_PR") || { echo "tier: the base changes of the pull request could not be read ($moved), so this check fails closed"; exit 1; }
+    fi
+    printf '%s' "$reviews" | node .gate/bin/lib/approval.mjs --owners .github/CODEOWNERS --author "${GATE_PR_AUTHOR:-}" --head "$head" --base "$base" ${after:+--after "$after"} ${moved:+--moved-at "${moved%% *}" --parent-head "${moved#* }"}
+    code=$?
+    # Waiting for his approval (exit 1): request his review, then fail as before.
+    [ "$code" -ne 0 ] || exit 0
+    [ "$code" -ne 1 ] || request_owners
+    exit 1
     ;;
   verdict)
-    out=$(tier_of) || { echo "$out"; exit 1; }
-    case "$out" in "tier 1"*) echo "$out"; echo "verdict: tier 1: not required"; exit 0 ;; esac
+    out=$(tier_of) || { guarded "$out"; exit 1; }
+    case "$out" in "tier 1"*) guarded "$out"; echo "verdict: tier 1: not required"; exit 0 ;; esac
     # From tier 2 it takes review's result: the one reviewer call of this pull request was review's.
     msg=$(wait_verdict)
     code=$?
     case "$msg" in
-      "::notice"*) printf '%s\n' "$msg"; echo "$out" ;; # the unavailable notice comes first
-      *) echo "$out"; printf '%s\n' "$msg" ;;
+      "::notice"*) printf '%s\n' "$msg"; guarded "$out" ;; # the unavailable notice comes first
+      *) guarded "$out"; printf '%s\n' "$msg" ;;
     esac
     exit "$code"
     ;;
@@ -347,7 +464,7 @@ case "${GATE_REVIEWER:-}" in
     ;;
   "")
     echo "::notice title=review-result::unavailable: no-reviewer"
-    echo "$job: reviewer unavailable (no-reviewer); no reviewer is configured (repository variable GATE_REVIEWER is unset), so this check fails closed"
+    echo "$job: reviewer unavailable (no-reviewer); no reviewer is configured (GATE_REVIEWER is empty in gate-trusted.yml on main), so this check fails closed"
     exit 1
     ;;
   *)
