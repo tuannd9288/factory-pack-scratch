@@ -15,7 +15,8 @@ Every pull request needs four checks green on its head commit:
 - `verify` (`gate.yml`): `main`'s verify, rules and red-check, run on your code.
 - `review` and `verdict` (`gate-trusted.yml`): the reviewer reads your change as data once `verify` passed. `verdict` passes
   at once on tier 1.
-- `tier`: below tier 3 it waits for `review` to end; on tier 3 it waits for the Human's approval of your change.
+- `tier`: it waits for `review` to end; on tier 3 it then waits for the Human's approval of your change, unless the
+  repository's merge switch is at `all`.
 
 The reviewer may raise a change to tier 3 (label `raised`), never lower one. A label never lowers a tier. The Human's
 approval holds while the patch is unchanged, as when the queue merges `main` in; a new patch needs a new one.
@@ -24,14 +25,16 @@ approval holds while the patch is unchanged, as when the queue merges `main` in;
 
 - `review is red; tier follows it`: this is not his wait. Re-run the failed jobs, never `review` alone.
 - A `tier` that waits for his approval is his wait. Never re-run it; the queue re-runs it after he approves.
-- A `tier` red on the claim (the body has no `Claim:` line, or it is not the tip of `claim/<n>`): take the issue with
-  `.gate/bin/claim <n> <team>`, which prints the `Claim:` line, or ask the holder to run
-  `.gate/bin/claim --handoff <n> <holder> <team>`. Only the holder or the Human releases a claim; the ref is never deleted.
+- A `tier` red on the claim (the body has no `Claim:` line, it is not the tip of `claim/<n>`, or its `Team:` is not the
+  team holding the claim): take the issue with `.gate/bin/claim <n> <team>`, which prints the `Claim:` line, or ask the
+  holder to run `.gate/bin/claim --handoff <n> <holder> <team>`; after a handoff, the body carries the new `Claim:` and
+  the new holder's `Team:`. Only the holder or the Human releases a claim; the ref is never deleted.
 
 ## The body's lines
 
 `verify` needs one line `Team: <name>`; editing the body runs the checks again. `tier` reads `Issue: #<n>` (or
-`Issue: none`) and `Claim: <sha>`. `Session:` and `Cost:` only inform. A pull request from a fork gets a red `review` by
+`Issue: none`) and `Claim: <sha>`, and on a claimed issue checks that `Team:` names the holder. `Session:` and `Cost:`
+only inform. A pull request from a fork gets a red `review` by
 design: push the branch to this repository.
 
 ## A blocking finding
